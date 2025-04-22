@@ -262,7 +262,7 @@ fn main() {
                                                 } else {
                                                     let m3u8_name = format!("{}.m3u8", file_stem);
                                                     let url = ts_url_prefix.as_deref().unwrap_or("").to_string() + &m3u8_name;
-                                                    let msg = format!("Processing complete: {}", url);
+                                                    let msg = format!("Processing complete: <{}>", url);
                                                     send_discord_webhook(webhook_url, &msg);
                                                 }
                                             }
