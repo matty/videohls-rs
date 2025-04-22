@@ -13,7 +13,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -r
 WORKDIR /app
 COPY --from=builder /app/target/release/videostream-rs /usr/local/bin/videostream-rs
 COPY config.toml ./
-
-RUN useradd -m appuser && chown appuser:appuser /usr/local/bin/videostream-rs /app/config.toml
-USER appuser
 ENTRYPOINT ["/usr/local/bin/videostream-rs"]
