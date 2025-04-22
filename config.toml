@@ -1,0 +1,17 @@
+# Video Streamer Configuration
+# Example config.toml
+
+# Directory to watch for webm files (optional, required if background=true)
+watch_dir = "./input"
+
+# Output directory for TS and m3u8 files
+output_dir = "./output"
+
+# Prefix for TS file URLs in m3u8 (optional)
+ts_url_prefix = "https://cdn.example.com/videos/"
+
+# Run in background and watch directory
+background = true
+
+# Supported video file extensions (comma separated, no spaces)
+video_extensions = "webm,mp4,mov,mkv,avi,flv,wmv,mpeg,mpg,m4v"
