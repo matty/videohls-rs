@@ -4,10 +4,10 @@ use std::time::Duration;
 use std::process::Command;
 use log::{info, warn, error, debug};
 use env_logger;
-use rayon::prelude::*;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Mutex};
 use reqwest;
 use serde_json;
+use std::collections::HashSet;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -145,25 +145,40 @@ fn main() {
                 let watch_dir = cfg.watch_dir.clone().expect("watch_dir required in background mode");
                 info!("Will watch directory: {}", watch_dir);
 
+                // Mutex to ensure only one file is processed at a time
+                let process_mutex = Arc::new(Mutex::new(()));
+                // Shared set of processed files
+                let processed_files = Arc::new(Mutex::new(HashSet::new()));
+
                 // Process existing .webm files in the directory before starting the watcher
                 let input_dir = std::path::Path::new(&watch_dir);
                 if let Ok(entries) = std::fs::read_dir(input_dir) {
                     let files: Vec<_> = entries.flatten().collect();
-                    files.par_iter().for_each(|entry| {
+                    for entry in files {
                         let path = entry.path();
-                        if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
-                            if fname.ends_with(".complete") || fname.ends_with(".failed") {
-                                debug!("Skipping processed file on startup: {:?}", path);
-                                return;
+                        let fname = match path.file_name().and_then(|s| s.to_str()) {
+                            Some(f) => f.to_string(),
+                            None => continue,
+                        };
+                        if fname.ends_with(".complete") || fname.ends_with(".failed") {
+                            debug!("Skipping processed file on startup: {:?}", path);
+                            continue;
+                        }
+                        // Check if already processed
+                        {
+                            let processed = processed_files.lock().unwrap();
+                            if processed.contains(&fname) {
+                                debug!("Already processed (startup): {}", fname);
+                                continue;
                             }
                         }
                         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                             if video_exts.iter().any(|v| v.eq_ignore_ascii_case(ext)) {
+                                let _lock = process_mutex.lock().unwrap();
                                 info!("Found existing video file on startup: {:?}", path);
-                                // Wait for file to be stable
                                 if !is_file_stable(&path, 3, 500) {
                                     warn!("File {:?} is not stable on startup, skipping", path);
-                                    return;
+                                    continue;
                                 }
                                 let input = path.to_string_lossy();
                                 info!("Processing file on startup: {}", input);
@@ -176,7 +191,6 @@ fn main() {
                                     prefix.push('/');
                                     prefix
                                 });
-                                // Discord webhook: file processing started
                                 if let Some(ref webhook_url) = cfg.discord_webhook_url {
                                     let msg = format!("Processing file: {}", input);
                                     send_discord_webhook(webhook_url, &msg);
@@ -186,7 +200,6 @@ fn main() {
                                     &output_subdir,
                                     ts_url_prefix.as_deref(),
                                 );
-                                // Discord webhook: error or complete
                                 if let Some(ref webhook_url) = cfg.discord_webhook_url {
                                     if let Err(ref e) = result {
                                         let msg = format!("Error processing file '{}': {}", input, e);
@@ -207,27 +220,44 @@ fn main() {
                                 } else {
                                     info!("Renamed processed file to: {:?}", processed_path);
                                 }
+                                // Mark as processed
+                                processed_files.lock().unwrap().insert(fname);
                             }
                         }
-                    });
+                    }
                 }
 
-                // Use the new notify API
+                let process_mutex_watcher = process_mutex.clone();
+                let processed_files_watcher = processed_files.clone();
+                let video_exts_watcher = video_exts.clone();
+                let output_dir = cfg.output_dir.clone();
+                let ts_url_prefix = cfg.ts_url_prefix.clone();
+                let discord_webhook_url = cfg.discord_webhook_url.clone();
                 let mut watcher: RecommendedWatcher = recommended_watcher(move |res: NotifyResult<Event>| {
                     match res {
                         Ok(event) => {
                             info!("Received event: {:?}", event);
                             if let EventKind::Create(_) | EventKind::Modify(_) = event.kind {
                                 for path in event.paths {
-                                    info!("Checking path: {:?}", path);
-                                    if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
-                                        if fname.ends_with(".complete") || fname.ends_with(".failed") {
-                                            debug!("Skipping processed file: {:?}", path);
+                                    let fname = match path.file_name().and_then(|s| s.to_str()) {
+                                        Some(f) => f.to_string(),
+                                        None => continue,
+                                    };
+                                    if fname.ends_with(".complete") || fname.ends_with(".failed") {
+                                        debug!("Skipping processed file: {:?}", path);
+                                        continue;
+                                    }
+                                    // Check if already processed
+                                    {
+                                        let processed = processed_files_watcher.lock().unwrap();
+                                        if processed.contains(&fname) {
+                                            debug!("Already processed (watcher): {}", fname);
                                             continue;
                                         }
                                     }
                                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                                        if video_exts.iter().any(|v| v.eq_ignore_ascii_case(ext)) {
+                                        if video_exts_watcher.iter().any(|v| v.eq_ignore_ascii_case(ext)) {
+                                            let _lock = process_mutex_watcher.lock().unwrap();
                                             info!("Detected video file: {:?}", path);
                                             if !is_file_stable(&path, 3, 500) {
                                                 warn!("File {:?} is not stable, skipping", path);
@@ -236,16 +266,15 @@ fn main() {
                                             let input = path.to_string_lossy();
                                             info!("Processing file: {}", input);
                                             let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-                                            let output_subdir = format!("{}/{}", cfg.output_dir, file_stem);
-                                            let ts_url_prefix = cfg.ts_url_prefix.as_ref().map(|prefix| {
+                                            let output_subdir = format!("{}/{}", output_dir, file_stem);
+                                            let ts_url_prefix = ts_url_prefix.as_ref().map(|prefix| {
                                                 let mut prefix = prefix.trim_end_matches('/').to_string();
                                                 prefix.push('/');
                                                 prefix.push_str(file_stem);
                                                 prefix.push('/');
                                                 prefix
                                             });
-                                            // Discord webhook: file processing started
-                                            if let Some(ref webhook_url) = cfg.discord_webhook_url {
+                                            if let Some(ref webhook_url) = discord_webhook_url {
                                                 let msg = format!("Processing file: {}", input);
                                                 send_discord_webhook(webhook_url, &msg);
                                             }
@@ -254,8 +283,7 @@ fn main() {
                                                 &output_subdir,
                                                 ts_url_prefix.as_deref(),
                                             );
-                                            // Discord webhook: error or complete
-                                            if let Some(ref webhook_url) = cfg.discord_webhook_url {
+                                            if let Some(ref webhook_url) = discord_webhook_url {
                                                 if let Err(ref e) = result {
                                                     let msg = format!("Error processing file '{}': {}", input, e);
                                                     send_discord_webhook(webhook_url, &msg);
@@ -275,6 +303,8 @@ fn main() {
                                             } else {
                                                 info!("Renamed processed file to: {:?}", processed_path);
                                             }
+                                            // Mark as processed
+                                            processed_files_watcher.lock().unwrap().insert(fname);
                                         }
                                     }
                                 }
