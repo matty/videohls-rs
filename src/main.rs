@@ -103,12 +103,121 @@ fn is_file_stable(path: &std::path::Path, checks: u32, delay_ms: u64) -> bool {
 fn send_discord_webhook(webhook_url: &str, content: &str) {
     let client = reqwest::blocking::Client::new();
     let payload = serde_json::json!({"content": content});
-    let res = client.post(webhook_url)
-        .json(&payload)
-        .send();
-    if let Err(e) = res {
-        error!("Failed to send Discord webhook: {}", e);
+    debug!("Sending webhook notification to Discord: {}", content);
+    
+    match client.post(webhook_url).json(&payload).send() {
+        Ok(response) => {
+            if !response.status().is_success() {
+                error!(
+                    "Discord webhook request failed with status code {}: {}",
+                    response.status(),
+                    response.status().canonical_reason().unwrap_or("Unknown")
+                );
+                
+                // Try to extract error details from response if available
+                match response.text() {
+                    Ok(text) if !text.is_empty() => {
+                        error!("Discord webhook error response: {}", text);
+                    }
+                    Err(e) => {
+                        error!("Failed to read Discord webhook error response: {}", e);
+                    }
+                    _ => {}
+                }
+            } else {
+                debug!("Discord webhook notification sent successfully");
+            }
+        },
+        Err(e) => {
+            error!("Failed to send Discord webhook: {}", e);
+            
+            // Log more detailed error information based on error type
+            if e.is_timeout() {
+                error!("Discord webhook timed out - webhook URL may be unreachable");
+            } else if e.is_connect() {
+                error!("Discord webhook connection failed - check network connectivity");
+            } else if e.is_request() {
+                error!("Discord webhook request failed - check webhook URL format");
+            } else if e.is_body() {
+                error!("Discord webhook request body error - message format issue");
+            }
+        }
     }
+}
+
+/// Constructs the URL prefix for TS files
+fn build_ts_url_prefix(base_prefix: &str, file_stem: &str) -> String {
+    let mut prefix = base_prefix.trim_end_matches('/').to_string();
+    prefix.push('/');
+    prefix.push_str(file_stem);
+    prefix.push('/');
+    prefix
+}
+
+/// Process a single video file and handle the result
+fn process_video_file(
+    path: &std::path::Path, 
+    output_dir: &str,
+    ts_url_prefix: Option<&str>,
+    webhook_url: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input_path = path.to_string_lossy();
+    info!("Processing file: {}", input_path);
+    
+    let file_stem = path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    
+    let output_subdir = format!("{}/{}", output_dir, file_stem);
+    
+    let url_prefix = ts_url_prefix.map(|prefix| build_ts_url_prefix(prefix, file_stem));
+    
+    // Send initial webhook notification
+    if let Some(webhook) = webhook_url {
+        let msg = format!("Processing file: {}", input_path);
+        send_discord_webhook(webhook, &msg);
+    }
+    
+    // Process the file
+    let result = process_webm_to_hls(
+        &input_path,
+        &output_subdir,
+        url_prefix.as_deref(),
+    );
+    
+    // Send completion webhook notification
+    if let Some(webhook) = webhook_url {
+        match &result {
+            Err(e) => {
+                let msg = format!("Error processing file '{}': {}", input_path, e);
+                send_discord_webhook(webhook, &msg);
+            },
+            Ok(_) => {
+                let m3u8_name = format!("{}.m3u8", file_stem);
+                let url = url_prefix.unwrap_or_default() + &m3u8_name;
+                let msg = format!("Processing complete: <{}>", url);
+                send_discord_webhook(webhook, &msg);
+            }
+        }
+    }
+    
+    result
+}
+
+/// Rename processed file with appropriate extension based on result
+fn rename_processed_file(
+    path: &std::path::Path, 
+    result: &Result<(), Box<dyn std::error::Error>>
+) -> std::io::Result<()> {
+    let mut processed_path = path.to_path_buf();
+    let new_ext = if result.is_ok() { ".complete" } else { ".failed" };
+    let complete_name = format!("{}{}", path.file_name().unwrap().to_string_lossy(), new_ext);
+    processed_path.set_file_name(complete_name);
+    
+    std::fs::rename(path, &processed_path)?;
+    info!("Renamed processed file to: {:?}", processed_path);
+    
+    Ok(())
 }
 
 fn main() {
@@ -160,11 +269,14 @@ fn main() {
                             Some(f) => f.to_string(),
                             None => continue,
                         };
+                        
+                        // Skip already processed files
                         if fname.ends_with(".complete") || fname.ends_with(".failed") {
                             debug!("Skipping processed file on startup: {:?}", path);
                             continue;
                         }
-                        // Check if already processed
+                        
+                        // Check if file is in our tracked processed set
                         {
                             let processed = processed_files.lock().unwrap();
                             if processed.contains(&fname) {
@@ -172,58 +284,39 @@ fn main() {
                                 continue;
                             }
                         }
-                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                            if video_exts.iter().any(|v| v.eq_ignore_ascii_case(ext)) {
-                                let _lock = process_mutex.lock().unwrap();
-                                info!("Found existing video file on startup: {:?}", path);
-                                if !is_file_stable(&path, 3, 500) {
-                                    warn!("File {:?} is not stable on startup, skipping", path);
-                                    continue;
-                                }
-                                let input = path.to_string_lossy();
-                                info!("Processing file on startup: {}", input);
-                                let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-                                let output_subdir = format!("{}/{}", cfg.output_dir, file_stem);
-                                let ts_url_prefix = cfg.ts_url_prefix.as_ref().map(|prefix| {
-                                    let mut prefix = prefix.trim_end_matches('/').to_string();
-                                    prefix.push('/');
-                                    prefix.push_str(file_stem);
-                                    prefix.push('/');
-                                    prefix
-                                });
-                                if let Some(ref webhook_url) = cfg.discord_webhook_url {
-                                    let msg = format!("Processing file: {}", input);
-                                    send_discord_webhook(webhook_url, &msg);
-                                }
-                                let result = process_webm_to_hls(
-                                    &input,
-                                    &output_subdir,
-                                    ts_url_prefix.as_deref(),
-                                );
-                                if let Some(ref webhook_url) = cfg.discord_webhook_url {
-                                    if let Err(ref e) = result {
-                                        let msg = format!("Error processing file '{}': {}", input, e);
-                                        send_discord_webhook(webhook_url, &msg);
-                                    } else {
-                                        let m3u8_name = format!("{}.m3u8", file_stem);
-                                        let url = ts_url_prefix.as_deref().unwrap_or("").to_string() + &m3u8_name;
-                                        let msg = format!("Processing complete: {}", url);
-                                        send_discord_webhook(webhook_url, &msg);
-                                    }
-                                }
-                                let mut processed_path = path.clone();
-                                let new_ext = if result.is_ok() { ".complete" } else { ".failed" };
-                                let complete_name = format!("{}{}", path.file_name().unwrap().to_string_lossy(), new_ext);
-                                processed_path.set_file_name(complete_name);
-                                if let Err(e) = std::fs::rename(&path, &processed_path) {
-                                    error!("Failed to rename processed file on startup: {}", e);
-                                } else {
-                                    info!("Renamed processed file to: {:?}", processed_path);
-                                }
-                                // Mark as processed
-                                processed_files.lock().unwrap().insert(fname);
-                            }
+                        
+                        // Skip non-video files
+                        let ext = match path.extension().and_then(|e| e.to_str()) {
+                            Some(ext) if video_exts.iter().any(|v| v.eq_ignore_ascii_case(ext)) => ext,
+                            _ => continue,
+                        };
+                        
+                        // Lock to ensure single file processing
+                        let _lock = process_mutex.lock().unwrap();
+                        
+                        info!("Found existing video file on startup: {:?}", path);
+                        
+                        // Skip unstable files (still being copied/written)
+                        if !is_file_stable(&path, 3, 500) {
+                            warn!("File {:?} is not stable on startup, skipping", path);
+                            continue;
                         }
+                        
+                        // Process the video file
+                        let result = process_video_file(
+                            &path,
+                            &cfg.output_dir,
+                            cfg.ts_url_prefix.as_deref(),
+                            cfg.discord_webhook_url.as_deref()
+                        );
+                        
+                        // Rename the processed file
+                        if let Err(e) = rename_processed_file(&path, &result) {
+                            error!("Failed to rename processed file: {}", e);
+                        }
+                        
+                        // Mark as processed in our tracking set
+                        processed_files.lock().unwrap().insert(fname);
                     }
                 }
 
@@ -233,6 +326,7 @@ fn main() {
                 let output_dir = cfg.output_dir.clone();
                 let ts_url_prefix = cfg.ts_url_prefix.clone();
                 let discord_webhook_url = cfg.discord_webhook_url.clone();
+                
                 let mut watcher: RecommendedWatcher = recommended_watcher(move |res: NotifyResult<Event>| {
                     match res {
                         Ok(event) => {
