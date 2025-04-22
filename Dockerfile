@@ -11,6 +11,6 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=builder /app/target/release/videostream-rs /usr/local/bin/videostream-rs
+COPY --from=builder /app/target/release/videohls-rs /usr/local/bin/videohls-rs
 COPY config.toml ./
-ENTRYPOINT ["/usr/local/bin/videostream-rs"]
+ENTRYPOINT ["/usr/local/bin/videohls-rs"]
