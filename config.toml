@@ -15,3 +15,6 @@ background = true
 
 # Supported video file extensions (comma separated, no spaces)
 video_extensions = "webm,mp4,mov,mkv,avi,flv,wmv,mpeg,mpg,m4v"
+
+# Discord webhook URL for notifications (optional)
+discord_webhook_url = ""

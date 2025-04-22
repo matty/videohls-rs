@@ -6,6 +6,8 @@ use log::{info, warn, error, debug};
 use env_logger;
 use rayon::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use reqwest;
+use serde_json;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -19,6 +21,8 @@ pub struct Config {
     pub background: bool,
     /// Supported video file extensions (comma separated, no spaces)
     pub video_extensions: Option<String>,
+    /// Discord webhook URL for notifications
+    pub discord_webhook_url: Option<String>,
 }
 
 impl Config {
@@ -95,6 +99,18 @@ fn is_file_stable(path: &std::path::Path, checks: u32, delay_ms: u64) -> bool {
     true
 }
 
+/// Send a message to a Discord webhook if the URL is set
+fn send_discord_webhook(webhook_url: &str, content: &str) {
+    let client = reqwest::blocking::Client::new();
+    let payload = serde_json::json!({"content": content});
+    let res = client.post(webhook_url)
+        .json(&payload)
+        .send();
+    if let Err(e) = res {
+        error!("Failed to send Discord webhook: {}", e);
+    }
+}
+
 fn main() {
     env_logger::init();
     let running = Arc::new(AtomicBool::new(true));
@@ -109,10 +125,16 @@ fn main() {
     let mut config = Config::from_file("config.toml");
     // Check for TS_URL_PREFIX env var and override if present
     let ts_url_prefix_env = std::env::var("TS_URL_PREFIX").ok();
+    // Check for DISCORD_WEBHOOK_URL env var and override if present
+    let discord_webhook_url_env = std::env::var("DISCORD_WEBHOOK_URL").ok();
     if let Ok(ref mut cfg) = config {
         if let Some(env_prefix) = ts_url_prefix_env {
             cfg.ts_url_prefix = Some(env_prefix);
             info!("Overriding ts_url_prefix from environment variable");
+        }
+        if let Some(env_webhook) = discord_webhook_url_env {
+            cfg.discord_webhook_url = Some(env_webhook);
+            info!("Overriding discord_webhook_url from environment variable");
         }
     }
     match config {
@@ -154,11 +176,28 @@ fn main() {
                                     prefix.push('/');
                                     prefix
                                 });
+                                // Discord webhook: file processing started
+                                if let Some(ref webhook_url) = cfg.discord_webhook_url {
+                                    let msg = format!("Processing file: {}", input);
+                                    send_discord_webhook(webhook_url, &msg);
+                                }
                                 let result = process_webm_to_hls(
                                     &input,
                                     &output_subdir,
                                     ts_url_prefix.as_deref(),
                                 );
+                                // Discord webhook: error or complete
+                                if let Some(ref webhook_url) = cfg.discord_webhook_url {
+                                    if let Err(ref e) = result {
+                                        let msg = format!("Error processing file '{}': {}", input, e);
+                                        send_discord_webhook(webhook_url, &msg);
+                                    } else {
+                                        let m3u8_name = format!("{}.m3u8", file_stem);
+                                        let url = ts_url_prefix.as_deref().unwrap_or("").to_string() + &m3u8_name;
+                                        let msg = format!("Processing complete: {}", url);
+                                        send_discord_webhook(webhook_url, &msg);
+                                    }
+                                }
                                 let mut processed_path = path.clone();
                                 let new_ext = if result.is_ok() { ".complete" } else { ".failed" };
                                 let complete_name = format!("{}{}", path.file_name().unwrap().to_string_lossy(), new_ext);
@@ -205,11 +244,28 @@ fn main() {
                                                 prefix.push('/');
                                                 prefix
                                             });
+                                            // Discord webhook: file processing started
+                                            if let Some(ref webhook_url) = cfg.discord_webhook_url {
+                                                let msg = format!("Processing file: {}", input);
+                                                send_discord_webhook(webhook_url, &msg);
+                                            }
                                             let result = process_webm_to_hls(
                                                 &input,
                                                 &output_subdir,
                                                 ts_url_prefix.as_deref(),
                                             );
+                                            // Discord webhook: error or complete
+                                            if let Some(ref webhook_url) = cfg.discord_webhook_url {
+                                                if let Err(ref e) = result {
+                                                    let msg = format!("Error processing file '{}': {}", input, e);
+                                                    send_discord_webhook(webhook_url, &msg);
+                                                } else {
+                                                    let m3u8_name = format!("{}.m3u8", file_stem);
+                                                    let url = ts_url_prefix.as_deref().unwrap_or("").to_string() + &m3u8_name;
+                                                    let msg = format!("Processing complete: {}", url);
+                                                    send_discord_webhook(webhook_url, &msg);
+                                                }
+                                            }
                                             let mut processed_path = path.clone();
                                             let new_ext = if result.is_ok() { ".complete" } else { ".failed" };
                                             let complete_name = format!("{}{}", path.file_name().unwrap().to_string_lossy(), new_ext);

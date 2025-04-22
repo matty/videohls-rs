@@ -1,7 +1,7 @@
 FROM rust:1.86 as builder
 WORKDIR /app
 # Install build dependencies for ffmpeg-sys-next and bindgen (libclang)
-RUN apt-get update && apt-get install -y pkg-config libavutil-dev libavformat-dev libavcodec-dev libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev ffmpeg clang libclang-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y pkg-config libssl-dev libavutil-dev libavformat-dev libavcodec-dev libavdevice-dev libavfilter-dev libswscale-dev libswresample-dev ffmpeg clang libclang-dev && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release
 
