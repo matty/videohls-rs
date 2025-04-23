@@ -13,4 +13,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -r
 WORKDIR /app
 COPY --from=builder /app/target/release/videohls-rs /usr/local/bin/videohls-rs
 COPY config.toml ./
+RUN mkdir -p /app/input /app/output
 ENTRYPOINT ["/usr/local/bin/videohls-rs"]
